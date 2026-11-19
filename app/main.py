@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 
 from aiohttp import web
@@ -8,11 +9,19 @@ from app.config import Config
 from app.db import init_db
 from app.services import (
     apply_contract,
+    get_contract_fields,
+    list_catalog_pages,
     list_contracts,
     list_reports,
+    list_rollbacks,
+    list_timeline,
+    rollback_preview,
+    rollback_table,
+    rollback_targets,
     run_breaking_check,
     run_reconcile,
 )
+from app.services import locks
 from app.services.errors import ServiceError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,7 +35,7 @@ def create_app(db_path: str | None = None) -> web.Application:
 
         os.environ["DATABASE_PATH"] = db_path
     init_db(db_path)
-    app = web.Application()
+    app = web.Application(middlewares=[error_middleware])
     app["db_path"] = db_path
     app.router.add_static("/static/", STATIC)
     app.router.add_get("/", root)
@@ -36,11 +45,38 @@ def create_app(db_path: str | None = None) -> web.Application:
     app.router.add_post("/api/logout", api_logout)
     app.router.add_get("/api/meta", api_meta)
     app.router.add_get("/api/contracts", api_contracts)
+    app.router.add_get("/api/contracts/{cid}", api_contract_detail)
     app.router.add_post("/api/contracts/{cid}/breaking-check", api_breaking)
     app.router.add_post("/api/contracts/{cid}/apply", api_apply)
+    app.router.add_get("/api/timeline", api_timeline)
+    app.router.add_get("/api/catalog-pages", api_catalog_pages)
     app.router.add_get("/api/reconcile-reports", api_reports)
     app.router.add_post("/api/reconcile-reports", api_reconcile)
+    app.router.add_get("/api/rollback/targets", api_rollback_targets)
+    app.router.add_get("/api/rollback/rollbacks", api_rollbacks)
+    app.router.add_get("/api/rollback/{table}/preview", api_rollback_preview)
+    app.router.add_post("/api/rollback/{table}/lock", api_lock_claim)
+    app.router.add_delete("/api/rollback/{table}/lock", api_lock_release)
+    app.router.add_post("/api/rollback/{table}", api_rollback)
     return app
+
+
+@web.middleware
+async def error_middleware(request: web.Request, handler):
+    """服务层抛什么，页面就收白话，不把堆栈漏给前端。"""
+    try:
+        return await handler(request)
+    except ServiceError as exc:
+        return json_resp({"ok": False, "error": exc.message}, exc.status_code)
+    except json.JSONDecodeError:
+        return json_resp({"ok": False, "error": "请求体不是合法 JSON"}, 400)
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower():
+            return json_resp(
+                {"ok": False, "error": "另一名值班正在改写这张表的版指针，稍后重试"},
+                409,
+            )
+        raise
 
 
 def _session(request: web.Request) -> dict:
@@ -67,6 +103,15 @@ def json_resp(data: dict, status: int = 200) -> web.Response:
         text=json.dumps(data, ensure_ascii=False),
         content_type="application/json",
     )
+
+
+def _actor(request: web.Request, body: dict | None = None) -> str:
+    """值班名：优先用请求里填的值班代号，其次用登录账号。"""
+    if body:
+        name = str(body.get("actor") or "").strip()
+        if name:
+            return name
+    return require_user(request)
 
 
 async def root(request: web.Request):
@@ -108,52 +153,111 @@ async def api_logout(_request: web.Request):
 
 
 async def api_meta(request: web.Request):
-    try:
-        require_user(request)
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
-    return json_resp({"lab": Config.LAB_NAME, "product": "cc-schema-lab"})
+    require_user(request)
+    return json_resp(
+        {
+            "lab": Config.LAB_NAME,
+            "product": "cc-schema-lab",
+            "rollback_window_minutes": Config.rollback_window_minutes(),
+        }
+    )
 
 
 async def api_contracts(request: web.Request):
-    try:
-        require_user(request)
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
+    require_user(request)
     return json_resp({"items": list_contracts(request.app.get("db_path"))})
 
 
+async def api_contract_detail(request: web.Request):
+    require_user(request)
+    cid = int(request.match_info["cid"])
+    return json_resp(get_contract_fields(cid, request.app.get("db_path")))
+
+
 async def api_breaking(request: web.Request):
-    try:
-        require_user(request)
-        cid = int(request.match_info["cid"])
-        return json_resp({"check": run_breaking_check(cid, request.app.get("db_path"))})
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
+    require_user(request)
+    cid = int(request.match_info["cid"])
+    return json_resp({"check": run_breaking_check(cid, request.app.get("db_path"))})
 
 
 async def api_apply(request: web.Request):
-    try:
-        require_user(request)
-        cid = int(request.match_info["cid"])
-        return json_resp({"contract": apply_contract(cid, request.app.get("db_path"))})
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
+    body = await _json_body(request)
+    cid = int(request.match_info["cid"])
+    actor = _actor(request, body)
+    note = str(body.get("note") or "").strip()
+    return json_resp(
+        {"contract": apply_contract(cid, actor=actor, note=note, db_path=request.app.get("db_path"))}
+    )
+
+
+async def api_timeline(request: web.Request):
+    require_user(request)
+    table = (request.query.get("table") or "").strip() or None
+    return json_resp({"items": list_timeline(table, request.app.get("db_path"))})
+
+
+async def api_catalog_pages(request: web.Request):
+    require_user(request)
+    table = (request.query.get("table") or "").strip() or None
+    return json_resp({"items": list_catalog_pages(table, request.app.get("db_path"))})
 
 
 async def api_reports(request: web.Request):
-    try:
-        require_user(request)
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
+    require_user(request)
     return json_resp({"items": list_reports(request.app.get("db_path"))})
 
 
 async def api_reconcile(request: web.Request):
+    require_user(request)
+    body = await _json_body(request)
+    as_of = str(body.get("as_of") or "").strip()
+    return json_resp({"report": run_reconcile(as_of, request.app.get("db_path"))})
+
+
+async def api_rollback_targets(request: web.Request):
+    require_user(request)
+    return json_resp({"items": rollback_targets(request.app.get("db_path"))})
+
+
+async def api_rollbacks(request: web.Request):
+    require_user(request)
+    return json_resp({"items": list_rollbacks(request.app.get("db_path"))})
+
+
+async def api_rollback_preview(request: web.Request):
+    require_user(request)
+    table = request.match_info["table"]
+    return json_resp({"preview": rollback_preview(table, request.app.get("db_path"))})
+
+
+async def api_rollback(request: web.Request):
+    body = await _json_body(request)
+    table = request.match_info["table"]
+    actor = _actor(request, body)
+    mode = str(body.get("mode") or "").strip()
+    note = str(body.get("note") or "").strip()
+    card = rollback_table(table, mode, actor=actor, note=note, db_path=request.app.get("db_path"))
+    return json_resp({"rollback": card})
+
+
+async def api_lock_claim(request: web.Request):
+    body = await _json_body(request)
+    table = request.match_info["table"]
+    actor = _actor(request, body)
+    return json_resp({"lock": locks.claim(request.app.get("db_path"), table, actor)})
+
+
+async def api_lock_release(request: web.Request):
+    body = await _json_body(request)
+    table = request.match_info["table"]
+    actor = _actor(request, body)
+    locks.release_claim(request.app.get("db_path"), table, actor)
+    return json_resp({"ok": True, "released": table})
+
+
+async def _json_body(request: web.Request) -> dict:
     try:
-        require_user(request)
         body = await request.json()
-        as_of = str(body.get("as_of") or "").strip() or "2026-11-18"
-        return json_resp({"report": run_reconcile(as_of, request.app.get("db_path"))})
-    except ServiceError as exc:
-        return json_resp({"error": exc.message}, exc.status_code)
+    except json.JSONDecodeError:
+        raise ServiceError("请求体不是合法 JSON", 400)
+    return body if isinstance(body, dict) else {}
